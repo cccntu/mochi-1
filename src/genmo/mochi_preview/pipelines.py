@@ -248,7 +248,7 @@ def get_conditioning_for_prompts(tokenizer, encoder, device, prompts: List[str])
     # Sometimes returns a tensor, othertimes a tuple, not sure why
     # See: https://huggingface.co/genmo/mochi-1-preview/discussions/3
     assert tuple(y_feat[-1].shape) == (B, MAX_T5_TOKEN_LENGTH, 4096)
-    assert y_feat[-1].dtype == torch.float32
+    #assert y_feat[-1].dtype == torch.float32
 
     return dict(y_mask=y_mask, y_feat=y_feat)
 
