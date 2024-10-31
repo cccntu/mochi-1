@@ -93,12 +93,17 @@ class T5ModelFactory(ModelFactory):
 
     def get_model(self, *, local_rank, device_id, world_size):
         super().get_model(local_rank=local_rank, device_id=device_id, world_size=world_size)
-        model = T5EncoderModel.from_pretrained(T5_MODEL)
+        #model = T5EncoderModel.from_pretrained(T5_MODEL)
+        model = T5EncoderModel.from_pretrained(
+            "black-forest-labs/FLUX.1-schnell",
+            subfolder="text_encoder_2",
+            torch_dtype=torch.bfloat16,
+        )
         if world_size > 1:
             model = setup_fsdp_sync(
                 model,
                 device_id=device_id,
-                param_dtype=torch.float32,
+                param_dtype=torch.bfloat16,
                 auto_wrap_policy=partial(
                     transformer_auto_wrap_policy,
                     transformer_layer_cls={
