@@ -29,9 +29,15 @@ from genmo.mochi_preview.dit.joint_model.utils import (
     pad_and_split_xy,
     unify_streams,
 )
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision('high')
+
 
 COMPILE_FINAL_LAYER = os.environ.get("COMPILE_DIT") == "1"
 COMPILE_MMDIT_BLOCK = os.environ.get("COMPILE_DIT") == "1"
+
+print(f'{COMPILE_FINAL_LAYER=}{COMPILE_MMDIT_BLOCK=}')
 
 from genmo.lib.attn_imports import comfy_attn, flash_varlen_qkvpacked_attn, sage_attn, sdpa_attn_ctx
 
@@ -96,6 +102,7 @@ class AsymmetricAttention(nn.Module):
         q_y, k_y, v_y = qkv_y.unbind(2)
         return q_y, k_y, v_y
 
+    @torch.compile(mode='max-autotune-no-cudagraphs')
     def prepare_qkv(
         self,
         x: torch.Tensor,  # (B, N, dim_x)
@@ -113,7 +120,7 @@ class AsymmetricAttention(nn.Module):
         # Process visual features
         qkv_x = self.qkv_x(x)  # (B, M, 3 * dim_x)
         assert qkv_x.dtype == torch.bfloat16
-        qkv_x = cp.all_to_all_collect_tokens(qkv_x, self.num_heads)  # (3, B, N, local_h, head_dim)
+        futures = cp.all_to_all_collect_tokens_async(qkv_x, self.num_heads)  # (3, B, N, local_h, head_dim)
 
         # Process text features
         y = modulated_rmsnorm(y, scale_y)  # (B, L, dim_y)
@@ -121,26 +128,9 @@ class AsymmetricAttention(nn.Module):
         q_y = self.q_norm_y(q_y)
         k_y = self.k_norm_y(k_y)
 
-        # Split qkv_x into q, k, v
-        q_x, k_x, v_x = qkv_x.unbind(0)  # (B, N, local_h, head_dim)
-        q_x = self.q_norm_x(q_x)
-        q_x = apply_rotary_emb_qk_real(q_x, rope_cos, rope_sin)
-        k_x = self.k_norm_x(k_x)
-        k_x = apply_rotary_emb_qk_real(k_x, rope_cos, rope_sin)
+        return q_y, k_y, v_y, futures
 
-        # Unite streams
-        qkv = unify_streams(
-            q_x,
-            k_x,
-            v_x,
-            q_y,
-            k_y,
-            v_y,
-            valid_token_indices,
-        )
-
-        return qkv
-
+    @torch.compiler.disable()
     def flash_attention(self, qkv, cu_seqlens, max_seqlen_in_batch, total, local_dim):
         with torch.autocast("cuda", enabled=False):
             out: torch.Tensor = flash_varlen_qkvpacked_attn(
@@ -171,7 +161,8 @@ class AsymmetricAttention(nn.Module):
             out = comfy_attn(q, k, v, heads=self.num_heads, skip_reshape=True)
             return out.squeeze(0)
 
-    @torch.compiler.disable()
+    #@torch.compiler.disable()
+    @torch.compile()
     def run_attention(
         self,
         qkv: torch.Tensor,  # (total <= B * (N + L), 3, local_heads, head_dim)
@@ -186,7 +177,7 @@ class AsymmetricAttention(nn.Module):
         _, cp_size = cp.get_cp_rank_size()
         N = cp_size * M
         assert self.num_heads % cp_size == 0
-        local_heads = self.num_heads // cp_size
+        local_heads = qkv.size(2)
         local_dim = local_heads * self.head_dim
         total = qkv.size(0)
 
@@ -207,13 +198,6 @@ class AsymmetricAttention(nn.Module):
         assert y.size() == (B, L, local_dim)
 
         x = x.view(B, N, local_heads, self.head_dim)
-        x = cp.all_to_all_collect_heads(x)  # (B, M, dim_x = num_heads * head_dim)
-        x = self.proj_x(x)  # (B, M, dim_x)
-
-        if cp.is_cp_active():
-            y = cp.all_gather(y)  # (cp_size * B, L, local_heads * head_dim)
-            y = rearrange(y, "(G B) L D -> B L (G D)", G=cp_size, D=local_dim)  # (B, L, dim_x)
-        y = self.proj_y(y)  # (B, L, dim_y)
         return x, y
 
     def forward(
@@ -243,29 +227,94 @@ class AsymmetricAttention(nn.Module):
 
         # Predict a packed QKV tensor from visual and text features.
         # Don't checkpoint the all_to_all.
-        qkv = self.prepare_qkv(
+        valid_token_indices=packed_indices["valid_token_indices_kv"]
+        q_y, k_y, v_y, qkv_x_futures = self.prepare_qkv(
             x=x,
             y=y,
             scale_x=scale_x,
             scale_y=scale_y,
             rope_cos=rope_rotation.get("rope_cos"),
             rope_sin=rope_rotation.get("rope_sin"),
-            valid_token_indices=packed_indices["valid_token_indices_kv"],
+            valid_token_indices=valid_token_indices,
         )  # (total <= B * (N + L), 3, local_heads, head_dim)
+        # Split qkv_x into q, k, v
 
-        x, y = self.run_attention(
-            qkv,
-            B=B,
-            L=L,
-            M=M,
-            cu_seqlens=packed_indices["cu_seqlens_kv"],
-            max_seqlen_in_batch=packed_indices["max_seqlen_in_batch_kv"],
-            valid_token_indices=packed_indices["valid_token_indices_kv"],
-        )
+        @torch.compile(mode='max-autotune-no-cudagraphs')
+        def process_qkv_x_before_attn(qkv_x,
+                                      rope_cos,
+                                      rope_sin,
+                                      q_y,
+                                      k_y,
+                                      v_y,
+                                      ):
+            qkv_x = cp.all_to_all_collect_tokens_async_post_process(qkv_x)
+            q_x, k_x, v_x = qkv_x.unbind(0)  # (B, N, local_h, head_dim)
+            q_x = self.q_norm_x(q_x)
+            q_x = apply_rotary_emb_qk_real(q_x, rope_cos, rope_sin)
+            k_x = self.k_norm_x(k_x)
+            k_x = apply_rotary_emb_qk_real(k_x, rope_cos, rope_sin)
+
+            # qkv of y are : (B, L, local_heads, head_dim)
+            # Unite streams
+            qkv = unify_streams(
+                q_x,
+                k_x,
+                v_x,
+                q_y,
+                k_y,
+                v_y,
+                valid_token_indices,
+            )
+            return qkv
+
+        xs = []
+        ys = []
+        for local_heads_i, (buffer, future) in enumerate(qkv_x_futures):
+            future.wait()
+            qkv = process_qkv_x_before_attn(
+                qkv_x=buffer,
+                rope_cos=rope_rotation.get("rope_cos").narrow(dim=1, start=local_heads_i, length=1),
+                rope_sin=rope_rotation.get("rope_sin").narrow(dim=1, start=local_heads_i, length=1),
+                q_y=q_y.narrow(dim=2, start=local_heads_i, length=1),
+                k_y=k_y.narrow(dim=2, start=local_heads_i, length=1),
+                v_y=v_y.narrow(dim=2, start=local_heads_i, length=1)
+            )
+            x, y = self.run_attention(
+                qkv,
+                B=B,
+                L=L,
+                M=M,
+                cu_seqlens=packed_indices["cu_seqlens_kv"],
+                max_seqlen_in_batch=packed_indices["max_seqlen_in_batch_kv"],
+                valid_token_indices=packed_indices["valid_token_indices_kv"],
+            )
+            xs.append(x)
+            ys.append(y.view(B, L, 1, self.head_dim))
+        #each of x in xs is of shape: (B, N, local_heads=1, self.head_dim)
+        x = torch.cat(xs, dim=2)
+        y = torch.cat(ys, dim=2).view((B,L, -1))
+
+        cp_rank, cp_size = cp.get_cp_rank_size()
+        y_future = None
+        if cp.is_cp_active():
+            y, y_future = cp.all_gather_async(y)  # (cp_size * B, L, local_heads * head_dim)
+        x_buffer, future = cp.all_to_all_collect_heads_async(x)
+
+        if y_future is not None:
+            y_future.wait()
+            y = rearrange(y, "(G B) L D -> B L (G D)", G=cp_size)#, D=local_dim)  # (B, L, dim_x)
+        y = self.proj_y(y)  # (B, L, dim_y)
+
+        future.wait()
+
+        # TODO: split into more parts and overlap comm and compute
+        x = cp.all_to_all_collect_heads_async_post_process(x_buffer)
+        del x_buffer
+        x = self.proj_x(x)  # (B, M, dim_x)
         return x, y
 
 
-@torch.compile(disable=not COMPILE_MMDIT_BLOCK)
+@torch.compile(disable=not COMPILE_MMDIT_BLOCK, mode='max-autotune-no-cudagraphs')
 class AsymmetricJointBlock(nn.Module):
     def __init__(
         self,

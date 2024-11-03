@@ -35,6 +35,12 @@ from genmo.mochi_preview.vae.model import Decoder, apply_tiled
 from genmo.lib.progress import get_new_progress_bar, progress_bar
 from genmo.lib.utils import Timer
 
+import xformers
+from xformers.profiler import PyTorchProfiler
+
+import torch._dynamo as dynamo
+dynamo.config.accumulated_cache_size_limit = 1024
+
 
 def linear_quadratic_schedule(num_steps, threshold_noise, linear_steps=None):
     if linear_steps is None:
@@ -68,10 +74,12 @@ def setup_fsdp_sync(model, device_id, *, param_dtype, auto_wrap_policy) -> FSDP:
         ),
         auto_wrap_policy=auto_wrap_policy,
         backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-        limit_all_gathers=True,
+        #limit_all_gathers=True,
         device_id=device_id,
         sync_module_states=True,
         use_orig_params=True,
+        forward_prefetch=True,
+        limit_all_gathers=False, # might cause OOM?
     )
     torch.cuda.synchronize()
     return model
@@ -365,6 +373,7 @@ def sample_model(device, dit, conditioning, **args):
         pred = pred.to(z)
         output_cond = output_cond.to(z)
         z = z + dsigma * pred
+        xformers.profiler.step()
 
     return z[:B] if cond_batched else z
 
@@ -643,7 +652,17 @@ class MochiMultiGPUPipeline:
 
     def __call__(self, **kwargs):
         def sample(ctx, *, batch_cfg, prompt, negative_prompt, **kwargs):
-            with progress_bar(type="ray_tqdm", enabled=ctx.local_rank == 0), torch.inference_mode():
+            with (
+                xformers.profiler.profile(
+                    output_dir="profile_data",
+                    module=ctx.dit,
+                    schedule=[
+                        (PyTorchProfiler, 2, 4),
+                    ]
+                ),
+                progress_bar(type="ray_tqdm", enabled=ctx.local_rank == 0),
+                torch.inference_mode(),
+            ):
                 conditioning = get_conditioning(
                     ctx.tokenizer,
                     ctx.text_encoder,

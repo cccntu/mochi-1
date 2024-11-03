@@ -97,7 +97,7 @@ def generate_video(
 
         assert isinstance(final_frames, np.ndarray)
         assert final_frames.dtype == np.float32
-
+        print(f'generation done')
         os.makedirs("outputs", exist_ok=True)
         output_path = os.path.join("outputs", f"output_{int(time.time())}.mp4")
 
@@ -111,12 +111,12 @@ def generate_video(
 from textwrap import dedent
 
 DEFAULT_PROMPT = dedent("""
-A hand with delicate fingers picks up a bright yellow lemon from a wooden bowl 
-filled with lemons and sprigs of mint against a peach-colored background. 
-The hand gently tosses the lemon up and catches it, showcasing its smooth texture. 
-A beige string bag sits beside the bowl, adding a rustic touch to the scene. 
-Additional lemons, one halved, are scattered around the base of the bowl. 
-The even lighting enhances the vibrant colors and creates a fresh, 
+A hand with delicate fingers picks up a bright yellow lemon from a wooden bowl
+filled with lemons and sprigs of mint against a peach-colored background.
+The hand gently tosses the lemon up and catches it, showcasing its smooth texture.
+A beige string bag sits beside the bowl, adding a rustic touch to the scene.
+Additional lemons, one halved, are scattered around the base of the bowl.
+The even lighting enhances the vibrant colors and creates a fresh,
 inviting atmosphere.
 """)
 
