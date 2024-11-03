@@ -653,13 +653,7 @@ class MochiMultiGPUPipeline:
     def __call__(self, **kwargs):
         def sample(ctx, *, batch_cfg, prompt, negative_prompt, **kwargs):
             with (
-                xformers.profiler.profile(
-                    output_dir="profile_data",
-                    module=ctx.dit,
-                    schedule=[
-                        (PyTorchProfiler, 2, 4),
-                    ]
-                ),
+
                 progress_bar(type="ray_tqdm", enabled=ctx.local_rank == 0),
                 torch.inference_mode(),
             ):
@@ -671,7 +665,16 @@ class MochiMultiGPUPipeline:
                     prompt=prompt,
                     negative_prompt=negative_prompt,
                 )
-                latents = sample_model(ctx.device, ctx.dit, conditioning=conditioning, **kwargs)
+                with xformers.profiler.profile(
+                    output_dir="profile_data",
+                    module=ctx.dit,
+                    schedule=[
+                        (PyTorchProfiler, 3, 100),
+                    ]
+                ) as prof:
+                    latents = sample_model(ctx.device, ctx.dit, conditioning=conditioning, **kwargs)
+                print(prof.format_summary())
+
                 if ctx.local_rank == 0:
                     torch.save(latents, "latents.pt")
                 frames = decode_latents(ctx.decoder, latents)

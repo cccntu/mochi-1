@@ -36,8 +36,9 @@ torch.set_float32_matmul_precision('high')
 
 COMPILE_FINAL_LAYER = os.environ.get("COMPILE_DIT") == "1"
 COMPILE_MMDIT_BLOCK = os.environ.get("COMPILE_DIT") == "1"
+DISABLE_COMPILE = os.environ.get("DISABLE_COMPILE") == "1"
 
-print(f'{COMPILE_FINAL_LAYER=}{COMPILE_MMDIT_BLOCK=}')
+print(f'{COMPILE_FINAL_LAYER=} {COMPILE_MMDIT_BLOCK=} {DISABLE_COMPILE=}')
 
 from genmo.lib.attn_imports import comfy_attn, flash_varlen_qkvpacked_attn, sage_attn, sdpa_attn_ctx
 
@@ -102,7 +103,7 @@ class AsymmetricAttention(nn.Module):
         q_y, k_y, v_y = qkv_y.unbind(2)
         return q_y, k_y, v_y
 
-    @torch.compile(mode='max-autotune-no-cudagraphs')
+    @torch.compile(disable=DISABLE_COMPILE,mode='max-autotune-no-cudagraphs')
     def prepare_qkv(
         self,
         x: torch.Tensor,  # (B, N, dim_x)
@@ -113,6 +114,7 @@ class AsymmetricAttention(nn.Module):
         rope_cos: torch.Tensor,
         rope_sin: torch.Tensor,
         valid_token_indices: torch.Tensor,
+        comm_n_heads_aat=1, # n heads at a time
     ):
         # Pre-norm for visual features
         x = modulated_rmsnorm(x, scale_x)  # (B, M, dim_x) where M = N / cp_group_size
@@ -120,7 +122,7 @@ class AsymmetricAttention(nn.Module):
         # Process visual features
         qkv_x = self.qkv_x(x)  # (B, M, 3 * dim_x)
         assert qkv_x.dtype == torch.bfloat16
-        futures = cp.all_to_all_collect_tokens_async(qkv_x, self.num_heads)  # (3, B, N, local_h, head_dim)
+        futures = cp.all_to_all_collect_tokens_async(qkv_x, self.num_heads, comm_n_heads_aat=comm_n_heads_aat)  # (3, B, N, local_h, head_dim)
 
         # Process text features
         y = modulated_rmsnorm(y, scale_y)  # (B, L, dim_y)
@@ -162,7 +164,7 @@ class AsymmetricAttention(nn.Module):
             return out.squeeze(0)
 
     #@torch.compiler.disable()
-    @torch.compile()
+    @torch.compile(disable=DISABLE_COMPILE)
     def run_attention(
         self,
         qkv: torch.Tensor,  # (total <= B * (N + L), 3, local_heads, head_dim)
@@ -228,6 +230,8 @@ class AsymmetricAttention(nn.Module):
         # Predict a packed QKV tensor from visual and text features.
         # Don't checkpoint the all_to_all.
         valid_token_indices=packed_indices["valid_token_indices_kv"]
+
+        comm_n_heads_aat=2 # TODO: try 2+4?
         q_y, k_y, v_y, qkv_x_futures = self.prepare_qkv(
             x=x,
             y=y,
@@ -236,10 +240,11 @@ class AsymmetricAttention(nn.Module):
             rope_cos=rope_rotation.get("rope_cos"),
             rope_sin=rope_rotation.get("rope_sin"),
             valid_token_indices=valid_token_indices,
+            comm_n_heads_aat=comm_n_heads_aat,
         )  # (total <= B * (N + L), 3, local_heads, head_dim)
         # Split qkv_x into q, k, v
 
-        @torch.compile(mode='max-autotune-no-cudagraphs')
+        @torch.compile(disable=DISABLE_COMPILE,mode='max-autotune-no-cudagraphs')
         def process_qkv_x_before_attn(qkv_x,
                                       rope_cos,
                                       rope_sin,
@@ -267,17 +272,18 @@ class AsymmetricAttention(nn.Module):
             )
             return qkv
 
-        xs = []
-        ys = []
-        for local_heads_i, (buffer, future) in enumerate(qkv_x_futures):
+        xs_futures = []
+        ys_futures = []
+        for i, (buffer, future) in enumerate(qkv_x_futures):
+            local_heads_i = comm_n_heads_aat * i
             future.wait()
             qkv = process_qkv_x_before_attn(
                 qkv_x=buffer,
-                rope_cos=rope_rotation.get("rope_cos").narrow(dim=1, start=local_heads_i, length=1),
-                rope_sin=rope_rotation.get("rope_sin").narrow(dim=1, start=local_heads_i, length=1),
-                q_y=q_y.narrow(dim=2, start=local_heads_i, length=1),
-                k_y=k_y.narrow(dim=2, start=local_heads_i, length=1),
-                v_y=v_y.narrow(dim=2, start=local_heads_i, length=1)
+                rope_cos=rope_rotation.get("rope_cos").narrow(dim=1, start=local_heads_i, length=comm_n_heads_aat),
+                rope_sin=rope_rotation.get("rope_sin").narrow(dim=1, start=local_heads_i, length=comm_n_heads_aat),
+                q_y=q_y.narrow(dim=2, start=local_heads_i, length=comm_n_heads_aat),
+                k_y=k_y.narrow(dim=2, start=local_heads_i, length=comm_n_heads_aat),
+                v_y=v_y.narrow(dim=2, start=local_heads_i, length=comm_n_heads_aat),
             )
             x, y = self.run_attention(
                 qkv,
@@ -288,28 +294,21 @@ class AsymmetricAttention(nn.Module):
                 max_seqlen_in_batch=packed_indices["max_seqlen_in_batch_kv"],
                 valid_token_indices=packed_indices["valid_token_indices_kv"],
             )
-            xs.append(x)
-            ys.append(y.view(B, L, 1, self.head_dim))
-        #each of x in xs is of shape: (B, N, local_heads=1, self.head_dim)
-        x = torch.cat(xs, dim=2)
-        y = torch.cat(ys, dim=2).view((B,L, -1))
-
+            y = y.view(B, L, comm_n_heads_aat, self.head_dim)
+            xs_futures.append(cp.all_to_all_collect_heads_async(x))
+            ys_futures.append(cp.all_gather_async(y))
+            #each of x in xs is of shape: (B, N, local_heads=comm_n_heads_aat, self.head_dim)
         cp_rank, cp_size = cp.get_cp_rank_size()
-        y_future = None
-        if cp.is_cp_active():
-            y, y_future = cp.all_gather_async(y)  # (cp_size * B, L, local_heads * head_dim)
-        x_buffer, future = cp.all_to_all_collect_heads_async(x)
-
-        if y_future is not None:
-            y_future.wait()
-            y = rearrange(y, "(G B) L D -> B L (G D)", G=cp_size)#, D=local_dim)  # (B, L, dim_x)
+        for y, f in ys_futures:
+            f.wait()
+        y = torch.cat([y for y,f in ys_futures], dim=2) # (G B), L, heads, D
+        y = rearrange(y, "(G B) L h D -> B L (G h D)", G=cp_size) # (B, L, dim_x)
         y = self.proj_y(y)  # (B, L, dim_y)
 
-        future.wait()
-
-        # TODO: split into more parts and overlap comm and compute
-        x = cp.all_to_all_collect_heads_async_post_process(x_buffer)
-        del x_buffer
+        for x, f in xs_futures:
+            f.wait()
+        x = torch.cat([x for x, f in xs_futures], dim=1)
+        x = cp.all_to_all_collect_heads_async_post_process(x)
         x = self.proj_x(x)  # (B, M, dim_x)
         return x, y
 

@@ -136,7 +136,7 @@ def all_to_all_collect_tokens(x: torch.Tensor, num_heads: int) -> torch.Tensor:
 
     return CollectTokens.apply(x, _CONTEXT_PARALLEL_GROUP, num_heads)
 @torch.compiler.disable()
-def all_to_all_collect_tokens_async(qkv: torch.Tensor, num_heads: int):#, group: dist.ProcessGroup):# -> List[Tuple[torch.Tensor, dist.Work]]:
+def all_to_all_collect_tokens_async(qkv: torch.Tensor, num_heads: int, comm_n_heads_aat: int):
     group = _CONTEXT_PARALLEL_GROUP
     """Split all_to_all into parts, return buffers and futures."""
     B = qkv.size(0)
@@ -161,9 +161,9 @@ def all_to_all_collect_tokens_async(qkv: torch.Tensor, num_heads: int):#, group:
     )#.contiguous()
 
     futures = []
-    for i in range(h):
+    for i in range(0, h, comm_n_heads_aat):
         # dim=2
-        qkv_part = rearranged.narrow(dim=2, start=i, length=1).contiguous()
+        qkv_part = rearranged.narrow(dim=2, start=i, length=comm_n_heads_aat).contiguous()
         #[:,:, i:i+1, :, :].contiguous()
 
         output_buffer = torch.empty_like(qkv_part)
