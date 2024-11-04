@@ -1,4 +1,5 @@
-from typing import Callable, List, Optional, Tuple, Union
+from functools import partial
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -6,7 +7,10 @@ import torch.nn.functional as F
 from einops import rearrange
 
 import genmo.mochi_preview.dit.joint_model.context_parallel as cp
+from genmo.lib.progress import get_new_progress_bar
 from genmo.mochi_preview.vae.cp_conv import cp_pass_frames, gather_all_frames
+from genmo.mochi_preview.vae.latent_dist import LatentDistribution
+import genmo.mochi_preview.vae.cp_conv as cp_conv
 
 
 def cast_tuple(t, length=1):
@@ -36,14 +40,13 @@ class SafeConv3d(torch.nn.Conv3d):
 
     def forward(self, input):
         memory_count = torch.prod(torch.tensor(input.shape)).item() * 2 / 1024**3
-        if memory_count > 2:
+        if memory_count > 2 and self.stride[0] == 1:
             part_num = int(memory_count / 2) + 1
             k = self.kernel_size[0]
             input_idx = torch.arange(k - 1, input.size(2))
             input_chunks_idx = torch.chunk(input_idx, part_num, dim=0)
 
-            # assert self.kernel_size == (3, 3, 3), f"kernel_size {self.kernel_size} != (3, 3, 3)"
-            assert self.stride[0] == 1, f"stride {self.stride}"
+            # assert self.stride[0] == 1, f"stride {self.stride}"
             assert self.dilation[0] == 1, f"dilation {self.dilation}"
             assert self.padding[0] == 0, f"padding {self.padding}"
 
@@ -137,7 +140,6 @@ class ContextParallelConv3d(SafeConv3d):
             pad_back = context_size - pad_front
 
         # Apply padding.
-        assert self.padding_mode == "replicate"  # DEBUG
         mode = "constant" if self.padding_mode == "zeros" else self.padding_mode
         if self.context_parallel and cp_world_size == 1:
             x = F.pad(x, (0, 0, 0, 0, pad_front, pad_back), mode=mode)
@@ -243,8 +245,10 @@ class ResBlock(nn.Module):
         *,
         affine: bool = True,
         attn_block: Optional[nn.Module] = None,
-        padding_mode: str = "replicate",
         causal: bool = True,
+        prune_bottleneck: bool = False,
+        padding_mode: str,
+        bias: bool = True,
     ):
         super().__init__()
         self.channels = channels
@@ -255,22 +259,22 @@ class ResBlock(nn.Module):
             nn.SiLU(inplace=True),
             ContextParallelConv3d(
                 in_channels=channels,
-                out_channels=channels,
+                out_channels=channels // 2 if prune_bottleneck else channels,
                 kernel_size=(3, 3, 3),
                 stride=(1, 1, 1),
                 padding_mode=padding_mode,
-                bias=True,
+                bias=bias,
                 causal=causal,
             ),
             norm_fn(channels, affine=affine),
             nn.SiLU(inplace=True),
             ContextParallelConv3d(
-                in_channels=channels,
+                in_channels=channels // 2 if prune_bottleneck else channels,
                 out_channels=channels,
                 kernel_size=(3, 3, 3),
                 stride=(1, 1, 1),
                 padding_mode=padding_mode,
-                bias=True,
+                bias=bias,
                 causal=causal,
             ),
         )
@@ -450,58 +454,9 @@ class CausalUpsampleBlock(nn.Module):
         return x
 
 
-def block_fn(channels, *, has_attention: bool = False, **block_kwargs):
+def block_fn(channels, *, affine: bool = True, has_attention: bool = False, **block_kwargs):
     attn_block = AttentionBlock(channels) if has_attention else None
-
-    return ResBlock(channels, affine=True, attn_block=attn_block, **block_kwargs)
-
-
-class DownsampleBlock(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        num_res_blocks,
-        *,
-        temporal_reduction=2,
-        spatial_reduction=2,
-        **block_kwargs,
-    ):
-        """
-        Downsample block for the VAE encoder.
-
-        Args:
-            in_channels: Number of input channels.
-            out_channels: Number of output channels.
-            num_res_blocks: Number of residual blocks.
-            temporal_reduction: Temporal reduction factor.
-            spatial_reduction: Spatial reduction factor.
-        """
-        super().__init__()
-        layers = []
-
-        # Change the channel count in the strided convolution.
-        # This lets the ResBlock have uniform channel count,
-        # as in ConvNeXt.
-        assert in_channels != out_channels
-        layers.append(
-            ContextParallelConv3d(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=(temporal_reduction, spatial_reduction, spatial_reduction),
-                stride=(temporal_reduction, spatial_reduction, spatial_reduction),
-                padding_mode="replicate",
-                bias=True,
-            )
-        )
-
-        for _ in range(num_res_blocks):
-            layers.append(block_fn(out_channels, **block_kwargs))
-
-        self.layers = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.layers(x)
+    return ResBlock(channels, affine=affine, attn_block=attn_block, **block_kwargs)
 
 
 def add_fourier_features(inputs: torch.Tensor, start=6, stop=8, step=1):
@@ -582,12 +537,13 @@ class Decoder(nn.Module):
         assert len(num_res_blocks) == self.num_up_blocks + 2
 
         blocks = []
+        new_block_fn = partial(block_fn, padding_mode="replicate")
 
         first_block = [nn.Conv3d(latent_dim, ch[-1], kernel_size=(1, 1, 1))]  # Input layer.
         # First set of blocks preserve channel count.
         for _ in range(num_res_blocks[-1]):
             first_block.append(
-                block_fn(
+                new_block_fn(
                     ch[-1],
                     has_attention=has_attention[-1],
                     causal=causal,
@@ -610,6 +566,7 @@ class Decoder(nn.Module):
                 temporal_expansion=temporal_expansions[-i - 1],
                 spatial_expansion=spatial_expansions[-i - 1],
                 causal=causal,
+                padding_mode="replicate",
                 **block_kwargs,
             )
             blocks.append(block)
@@ -619,32 +576,11 @@ class Decoder(nn.Module):
         # Last block. Preserve channel count.
         last_block = []
         for _ in range(num_res_blocks[0]):
-            last_block.append(block_fn(ch[0], has_attention=has_attention[0], causal=causal, **block_kwargs))
+            last_block.append(new_block_fn(ch[0], has_attention=has_attention[0], causal=causal, **block_kwargs))
         blocks.append(nn.Sequential(*last_block))
 
         self.blocks = nn.ModuleList(blocks)
         self.output_proj = Conv1x1(ch[0], out_channels)
-
-    def unnormalize_latents(
-        self,
-        z: torch.Tensor,
-        mean: torch.Tensor,
-        std: torch.Tensor,
-    ) -> torch.Tensor:
-        """Unnormalize latents. Useful for decoding DiT samples.
-
-        Args:
-            z (torch.Tensor): [B, C_z, T_z, H_z, W_z], float
-
-        Returns:
-            torch.Tensor: [B, C_z, T_z, H_z, W_z], float
-        """
-        mean = mean[:, None, None, None]
-        std = std[:, None, None, None]
-
-        assert z.ndim == 5
-        assert z.size(1) == mean.size(0) == std.size(0)
-        return z * std.to(z) + mean.to(z)
 
     def forward(self, x):
         """Forward pass.
@@ -657,8 +593,6 @@ class Decoder(nn.Module):
                T + 1 = (t - 1) * 4.
                H = h * 16, W = w * 16.
         """
-        x = self.unnormalize_latents(x, self.vae_mean, self.vae_std)
-
         for block in self.blocks:
             x = block(x)
 
@@ -806,3 +740,277 @@ def apply_tiled(
         return blend_vertical(top, bottom, out_overlap)
 
     raise ValueError(f"Invalid num_tiles_w={num_tiles_w} and num_tiles_h={num_tiles_h}")
+
+
+class DownsampleBlock(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        num_res_blocks,
+        *,
+        temporal_reduction=2,
+        spatial_reduction=2,
+        **block_kwargs,
+    ):
+        """
+        Downsample block for the VAE encoder.
+
+        Args:
+            in_channels: Number of input channels.
+            out_channels: Number of output channels.
+            num_res_blocks: Number of residual blocks.
+            temporal_reduction: Temporal reduction factor.
+            spatial_reduction: Spatial reduction factor.
+        """
+        super().__init__()
+        layers = []
+
+        assert in_channels != out_channels
+        layers.append(
+            ContextParallelConv3d(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=(temporal_reduction, spatial_reduction, spatial_reduction),
+                stride=(temporal_reduction, spatial_reduction, spatial_reduction),
+                # First layer in each block always uses replicate padding
+                padding_mode="replicate",
+                bias=block_kwargs["bias"],
+            )
+        )
+
+        for _ in range(num_res_blocks):
+            layers.append(block_fn(out_channels, **block_kwargs))
+
+        self.layers = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.layers(x)
+
+
+class Encoder(nn.Module):
+    def __init__(
+        self,
+        *,
+        in_channels: int,
+        base_channels: int,
+        channel_multipliers: List[int],
+        num_res_blocks: List[int],
+        latent_dim: int,
+        temporal_reductions: List[int],
+        spatial_reductions: List[int],
+        prune_bottlenecks: List[bool],
+        has_attentions: List[bool],
+        affine: bool = True,
+        bias: bool = True,
+        input_is_conv_1x1: bool = False,
+        padding_mode: str,
+    ):
+        super().__init__()
+        self.temporal_reductions = temporal_reductions
+        self.spatial_reductions = spatial_reductions
+        self.base_channels = base_channels
+        self.channel_multipliers = channel_multipliers
+        self.num_res_blocks = num_res_blocks
+        self.latent_dim = latent_dim
+
+        ch = [mult * base_channels for mult in channel_multipliers]
+        num_down_blocks = len(ch) - 1
+        assert len(num_res_blocks) == num_down_blocks + 2
+
+        layers = (
+            [nn.Conv3d(in_channels, ch[0], kernel_size=(1, 1, 1), bias=True)]
+            if not input_is_conv_1x1
+            else [Conv1x1(in_channels, ch[0])]
+        )
+
+        assert len(prune_bottlenecks) == num_down_blocks + 2
+        assert len(has_attentions) == num_down_blocks + 2
+        block = partial(block_fn, padding_mode=padding_mode, affine=affine, bias=bias)
+
+        for _ in range(num_res_blocks[0]):
+            layers.append(block(ch[0], has_attention=has_attentions[0], prune_bottleneck=prune_bottlenecks[0]))
+        prune_bottlenecks = prune_bottlenecks[1:]
+        has_attentions = has_attentions[1:]
+
+        assert len(temporal_reductions) == len(spatial_reductions) == len(ch) - 1
+        for i in range(num_down_blocks):
+            layer = DownsampleBlock(
+                ch[i],
+                ch[i + 1],
+                num_res_blocks=num_res_blocks[i + 1],
+                temporal_reduction=temporal_reductions[i],
+                spatial_reduction=spatial_reductions[i],
+                prune_bottleneck=prune_bottlenecks[i],
+                has_attention=has_attentions[i],
+                affine=affine,
+                bias=bias,
+                padding_mode=padding_mode,
+            )
+
+            layers.append(layer)
+
+        # Additional blocks.
+        for _ in range(num_res_blocks[-1]):
+            layers.append(block(ch[-1], has_attention=has_attentions[-1], prune_bottleneck=prune_bottlenecks[-1]))
+
+        self.layers = nn.Sequential(*layers)
+
+        # Output layers.
+        self.output_norm = norm_fn(ch[-1])
+        self.output_proj = Conv1x1(ch[-1], 2 * latent_dim, bias=False)
+
+    @property
+    def temporal_downsample(self):
+        return math.prod(self.temporal_reductions)
+
+    @property
+    def spatial_downsample(self):
+        return math.prod(self.spatial_reductions)
+
+    def forward(self, x) -> LatentDistribution:
+        """Forward pass.
+
+        Args:
+            x: Input video tensor. Shape: [B, C, T, H, W]. Scaled to [-1, 1]
+
+        Returns:
+            means: Latent tensor. Shape: [B, latent_dim, t, h, w]. Scaled [-1, 1].
+                   h = H // 8, w = W // 8, t - 1 = (T - 1) // 6
+            logvar: Shape: [B, latent_dim, t, h, w].
+        """
+        assert x.ndim == 5, f"Expected 5D input, got {x.shape}"
+
+        x = self.layers(x)
+
+        x = self.output_norm(x)
+        x = F.silu(x, inplace=True)
+        x = self.output_proj(x)
+
+        means, logvar = torch.chunk(x, 2, dim=1)
+
+        assert means.ndim == 5
+        assert logvar.shape == means.shape
+        assert means.size(1) == self.latent_dim
+
+        return LatentDistribution(means, logvar)
+
+
+def normalize_decoded_frames(samples):
+    samples = samples.float()
+    samples = (samples + 1.0) / 2.0
+    samples.clamp_(0.0, 1.0)
+    frames = rearrange(samples, "b c t h w -> b t h w c")
+    return frames
+
+@torch.inference_mode()
+def decode_latents_tiled_full(
+    decoder,
+    z,
+    *,
+    tile_sample_min_height: int = 240,
+    tile_sample_min_width: int = 424,
+    tile_overlap_factor_height: float = 0.1666,
+    tile_overlap_factor_width: float = 0.2,
+    auto_tile_size: bool = True,
+    frame_batch_size: int = 6,
+):
+    B, C, T, H, W = z.shape
+    assert frame_batch_size <= T, f"frame_batch_size must be <= T, got {frame_batch_size} > {T}"
+
+    tile_sample_min_height = tile_sample_min_height if not auto_tile_size else H // 2 * 8
+    tile_sample_min_width = tile_sample_min_width if not auto_tile_size else W // 2 * 8
+
+    tile_latent_min_height = int(tile_sample_min_height / 8)
+    tile_latent_min_width = int(tile_sample_min_width / 8)
+
+    def blend_v(a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
+        blend_extent = min(a.shape[3], b.shape[3], blend_extent)
+        for y in range(blend_extent):
+            b[:, :, :, y, :] = a[:, :, :, -blend_extent + y, :] * (1 - y / blend_extent) + b[:, :, :, y, :] * (
+                y / blend_extent
+            )
+        return b
+
+    def blend_h(a: torch.Tensor, b: torch.Tensor, blend_extent: int) -> torch.Tensor:
+        blend_extent = min(a.shape[4], b.shape[4], blend_extent)
+        for x in range(blend_extent):
+            b[:, :, :, :, x] = a[:, :, :, :, -blend_extent + x] * (1 - x / blend_extent) + b[:, :, :, :, x] * (
+                x / blend_extent
+            )
+        return b
+
+    overlap_height = int(tile_latent_min_height * (1 - tile_overlap_factor_height))
+    overlap_width = int(tile_latent_min_width * (1 - tile_overlap_factor_width))
+    blend_extent_height = int(tile_sample_min_height * tile_overlap_factor_height)
+    blend_extent_width = int(tile_sample_min_width * tile_overlap_factor_width)
+    row_limit_height = tile_sample_min_height - blend_extent_height
+    row_limit_width = tile_sample_min_width - blend_extent_width
+
+    # Split z into overlapping tiles and decode them separately.
+    # The tiles have an overlap to avoid seams between tiles.
+    pbar = get_new_progress_bar(
+        desc="Decoding latent tiles",
+        total=len(range(0, H, overlap_height)) * len(range(0, W, overlap_width)) * len(range(T // frame_batch_size)),
+    )
+    rows = []
+    for i in range(0, H, overlap_height):
+        row = []
+        for j in range(0, W, overlap_width):
+            temporal = []
+            for k in range(T // frame_batch_size):
+                remaining_frames = T % frame_batch_size
+                start_frame = frame_batch_size * k + (0 if k == 0 else remaining_frames)
+                end_frame = frame_batch_size * (k + 1) + remaining_frames
+                tile = z[
+                    :,
+                    :,
+                    start_frame:end_frame,
+                    i : i + tile_latent_min_height,
+                    j : j + tile_latent_min_width,
+                ]
+                tile = decoder(tile)
+                temporal.append(tile)
+                pbar.update(1)
+            row.append(torch.cat(temporal, dim=2))
+        rows.append(row)
+
+    result_rows = []
+    for i, row in enumerate(rows):
+        result_row = []
+        for j, tile in enumerate(row):
+            # blend the above tile and the left tile
+            # to the current tile and add the current tile to the result row
+            if i > 0:
+                tile = blend_v(rows[i - 1][j], tile, blend_extent_height)
+            if j > 0:
+                tile = blend_h(row[j - 1], tile, blend_extent_width)
+            result_row.append(tile[:, :, :, :row_limit_height, :row_limit_width])
+        result_rows.append(torch.cat(result_row, dim=4))
+
+    return normalize_decoded_frames(torch.cat(result_rows, dim=3))
+
+
+@torch.inference_mode()
+def decode_latents_tiled_spatial(
+    decoder,
+    z,
+    *,
+    num_tiles_w: int,
+    num_tiles_h: int,
+    overlap: int = 0,  # Number of pixel of overlap between adjacent tiles.
+    # Use a factor of 2 times the latent downsample factor.
+    min_block_size: int = 1,  # Minimum number of pixels in each dimension when subdividing.
+):
+    decoded = apply_tiled(decoder, z, num_tiles_w, num_tiles_h, overlap, min_block_size)
+    assert decoded is not None, f"Failed to decode latents with tiled spatial method"
+    return normalize_decoded_frames(decoded)
+
+@torch.inference_mode()
+def decode_latents(decoder, z):
+    cp_rank, cp_size = cp.get_cp_rank_size()
+    z = z.tensor_split(cp_size, dim=2)[cp_rank]  # split along temporal dim
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        samples = decoder(z)
+    samples = cp_conv.gather_all_frames(samples)
+    return normalize_decoded_frames(samples)

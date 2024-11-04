@@ -7,6 +7,8 @@ import click
 import numpy as np
 import torch
 
+from genmo.lib.progress import progress_bar
+from genmo.lib.utils import save_video
 from genmo.mochi_preview.pipelines import (
     DecoderModelFactory,
     DitModelFactory,
@@ -15,8 +17,6 @@ from genmo.mochi_preview.pipelines import (
     T5ModelFactory,
     linear_quadratic_schedule,
 )
-from genmo.lib.progress import progress_bar
-from genmo.lib.utils import save_video
 
 pipeline = None
 model_dir_path = None
@@ -38,10 +38,12 @@ def load_model():
         klass = MochiSingleGPUPipeline if num_gpus == 1 else MochiMultiGPUPipeline
         kwargs = dict(
             text_encoder_factory=T5ModelFactory(),
-            dit_factory=DitModelFactory(model_path=f"{MOCHI_DIR}/dit.safetensors", model_dtype="bf16"),
+            dit_factory=DitModelFactory(
+                model_path=f"{MOCHI_DIR}/dit.safetensors",
+                model_dtype="bf16"
+            ),
             decoder_factory=DecoderModelFactory(
-                model_path=f"{MOCHI_DIR}/vae.safetensors",
-                model_stats_path=f"{MOCHI_DIR}/vae_stats.json",
+                model_path=f"{MOCHI_DIR}/decoder.safetensors",
             ),
         )
         if num_gpus > 1:
@@ -49,7 +51,8 @@ def load_model():
             kwargs["world_size"] = num_gpus
         else:
             kwargs["cpu_offload"] = cpu_offload
-            #kwargs["tiled_decode"] = True
+            kwargs["tiled_decode"] = True
+            kwargs["decode_type"] = "tiled_full"
         pipeline = klass(**kwargs)
 
 
@@ -126,7 +129,7 @@ inviting atmosphere.
 @click.option("--width", default=848, type=int, help="Width of the video.")
 @click.option("--height", default=480, type=int, help="Height of the video.")
 @click.option("--num_frames", default=163, type=int, help="Number of frames.")
-@click.option("--seed", default=12345, type=int, help="Random seed.")
+@click.option("--seed", default=1710977262, type=int, help="Random seed.")
 @click.option("--cfg_scale", default=4.5, type=float, help="CFG Scale.")
 @click.option("--num_steps", default=64, type=int, help="Number of inference steps.")
 @click.option("--model_dir", required=True, help="Path to the model directory.")

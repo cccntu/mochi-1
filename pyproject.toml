@@ -16,13 +16,19 @@ dependencies = [
     "sentencepiece>=0.2.0",
     "setuptools>=75.2.0",
     "torch>=2.4.1",
+    "torchvision>=0.19.1",
     "transformers>=4.45.2",
     "accelerate",
 ]
 
 [project.optional-dependencies]
 flash = [
-    "flash-attn>=2.6.3",
+    "flash-attn>=2.6.3"
+]
+
+torchvision = [
+    "torchvision>=0.15.0",
+    "pyav>=13.1.0"
 ]
 
 [tool.ruff]
