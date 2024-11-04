@@ -556,7 +556,7 @@ class MochiMultiGPUPipeline:
                     output_dir="profile_data",
                     module=ctx.dit,
                     schedule=[
-                        (PyTorchProfiler, 3, 100),
+                        (PyTorchProfiler, 3, 5),
                     ]
                 ) as prof:
                     latents = sample_model(ctx.device, ctx.dit, conditioning=conditioning, **kwargs)
