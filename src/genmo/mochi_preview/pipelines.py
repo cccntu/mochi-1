@@ -33,7 +33,7 @@ from transformers.models.t5.modeling_t5 import T5Block
 import genmo.mochi_preview.dit.joint_model.context_parallel as cp
 import genmo.mochi_preview.vae.cp_conv as cp_conv
 from genmo.lib.progress import get_new_progress_bar, progress_bar
-from genmo.lib.utils import Timer
+from genmo.lib.utils import Timer, CudaTimer
 from genmo.mochi_preview.vae.models import (
     Decoder,
     decode_latents,
@@ -100,7 +100,12 @@ class T5ModelFactory(ModelFactory):
 
     def get_model(self, *, local_rank, device_id, world_size):
         super().get_model(local_rank=local_rank, device_id=device_id, world_size=world_size)
-        model = T5EncoderModel.from_pretrained(T5_MODEL)
+#        model = T5EncoderModel.from_pretrained(T5_MODEL)
+        model = T5EncoderModel.from_pretrained(
+            "black-forest-labs/FLUX.1-schnell",
+            subfolder="text_encoder_2",
+            torch_dtype=torch.bfloat16,
+        )
         if world_size > 1:
             model = setup_fsdp_sync(
                 model,
@@ -354,18 +359,22 @@ def sample_model(device, dit, conditioning, **args):
         return out_uncond + cfg_scale * (out_cond - out_uncond)
 
     # Euler sampler w/ customizable sigma schedule & cfg scale
-    for i in get_new_progress_bar(range(0, sample_steps), desc="Sampling"):
-        sigma = sigma_schedule[i]
-        dsigma = sigma - sigma_schedule[i + 1]
 
-        # `pred` estimates `z_0 - eps`.
-        pred = model_fn(
-            z=z,
-            sigma=torch.full([B] if cond_text else [B * 2], sigma, device=z.device),
-            cfg_scale=cfg_schedule[i],
-        )
-        assert pred.dtype == torch.float32
-        z = z + dsigma * pred
+    with CudaTimer("sampling steps", skip_steps=2) as timer:
+        for i in get_new_progress_bar(range(0, sample_steps), desc="Sampling"):
+            sigma = sigma_schedule[i]
+            dsigma = sigma - sigma_schedule[i + 1]
+
+            # `pred` estimates `z_0 - eps`.
+            pred = model_fn(
+                z=z,
+                sigma=torch.full([B] if cond_text else [B * 2], sigma, device=z.device),
+                cfg_scale=cfg_schedule[i],
+            )
+            assert pred.dtype == torch.float32
+            z = z + dsigma * pred
+            timer.step()
+        print(timer.summary())
 
     z = z[:B] if cond_batched else z
     return dit_latents_to_vae_latents(z)
