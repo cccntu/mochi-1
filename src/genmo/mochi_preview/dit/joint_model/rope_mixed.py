@@ -59,7 +59,7 @@ def create_position_matrix(
         # Stack and reshape the grids.
         pos = torch.stack([grid_t, grid_h, grid_w], dim=-1)  # [T, pH, pW, 3]
         pos = pos.view(-1, 3)  # [T * pH * pW, 3]
-        pos = pos.to(dtype=dtype, device=device)
+        pos = pos.to(dtype=dtype, device=device, non_blocking=True)
 
     return pos
 
@@ -82,7 +82,7 @@ def compute_mixed_rotation(
     """
     with torch.autocast("cuda", enabled=False):
         assert freqs.ndim == 3
-        freqs_sum = torch.einsum("Nd,dhf->Nhf", pos.to(freqs), freqs)
+        freqs_sum = torch.einsum("Nd,dhf->Nhf", pos.to(freqs,non_blocking=True), freqs)
         freqs_cos = torch.cos(freqs_sum)
         freqs_sin = torch.sin(freqs_sum)
     return freqs_cos, freqs_sin

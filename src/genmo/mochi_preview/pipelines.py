@@ -391,6 +391,7 @@ def sample_model(device, dit, conditioning, **args):
 
     # Euler sampler w/ customizable sigma schedule & cfg scale
     with CudaTimer("sampling steps", skip_steps=2) as timer:
+    #with nullcontext():
         for i in get_new_progress_bar(range(0, sample_steps), desc="Sampling"):
             sigma = sigma_schedule[i]
             dsigma = sigma - sigma_schedule[i + 1]
@@ -585,7 +586,7 @@ class MochiMultiGPUPipeline:
                         output_dir="profile_data",
                         module=ctx.dit,
                         schedule=[
-                            (PyTorchProfiler, 3, 5),
+                            (PyTorchProfiler, 3, 4),
                         ],
                     )
                 with profiler_context as prof:

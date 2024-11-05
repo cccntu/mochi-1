@@ -104,7 +104,7 @@ class AsymmetricAttention(nn.Module):
         q_y, k_y, v_y = qkv_y.unbind(2)
         return q_y, k_y, v_y
 
-    @torch.compile(disable=DISABLE_COMPILE, mode="max-autotune-no-cudagraphs")
+    #@torch.compile(disable=DISABLE_COMPILE, mode="max-autotune-no-cudagraphs")
     def prepare_qkv(
         self,
         x: torch.Tensor,  # (B, N, dim_x)
@@ -142,11 +142,15 @@ class AsymmetricAttention(nn.Module):
 
         # futures = cp.all_to_all_collect_tokens_async(qkv_x, self.num_heads, comm_n_heads_aat=comm_n_heads_aat)  # (3, B, N, local_h, head_dim)
 
-        # Process text features
-        y = modulated_rmsnorm(y, scale_y)  # (B, L, dim_y)
-        q_y, k_y, v_y = self.run_qkv_y(y)  # (B, L, local_heads, head_dim)
-        q_y = self.q_norm_y(q_y)
-        k_y = self.k_norm_y(k_y)
+        @torch.compile(disable=DISABLE_COMPILE, mode="max-autotune-no-cudagraphs")
+        def process_text(y, scale_y):
+            # Process text features
+            y = modulated_rmsnorm(y, scale_y)  # (B, L, dim_y)
+            q_y, k_y, v_y = self.run_qkv_y(y)  # (B, L, local_heads, head_dim)
+            q_y = self.q_norm_y(q_y)
+            k_y = self.k_norm_y(k_y)
+            return  q_y, k_y, v_y
+        q_y, k_y, v_y = process_text(y, scale_y)
 
         return q_y, k_y, v_y, futures
 
@@ -221,6 +225,38 @@ class AsymmetricAttention(nn.Module):
         y = y.view(B, L, local_heads, self.head_dim)
         return x, y
 
+    @torch.compile(disable=DISABLE_COMPILE, mode="max-autotune-no-cudagraphs")
+    def process_qkv_x_before_attn(
+        self,
+        qkv_x,
+        rope_cos,
+        rope_sin,
+        q_y,
+        k_y,
+        v_y,
+        valid_token_indices,
+    ):
+        qkv_x = cp.all_to_all_collect_tokens_async_post_process(qkv_x)
+        q_x, k_x, v_x = qkv_x.unbind(0)  # (B, N, local_h, head_dim)
+        q_x = self.q_norm_x(q_x)
+        q_x = apply_rotary_emb_qk_real(q_x, rope_cos, rope_sin)
+        k_x = self.k_norm_x(k_x)
+        k_x = apply_rotary_emb_qk_real(k_x, rope_cos, rope_sin)
+
+        # qkv of y are : (B, L, local_heads, head_dim)
+        # Unite streams
+        qkv = unify_streams(
+            q_x,
+            k_x,
+            v_x,
+            q_y,
+            k_y,
+            v_y,
+            valid_token_indices,
+        )
+        return qkv
+
+
     def forward(
         self,
         x: torch.Tensor,  # (B, N, dim_x)
@@ -250,7 +286,7 @@ class AsymmetricAttention(nn.Module):
         # Don't checkpoint the all_to_all.
         valid_token_indices = packed_indices["valid_token_indices_kv"]
 
-        comm_n_heads_aat = 2  # TODO: try 2+4?
+        comm_n_heads_aat = 6  # TODO: try 2+4?
         q_y, k_y, v_y, qkv_x_futures = self.prepare_qkv(
             x=x,
             y=y,
@@ -263,47 +299,19 @@ class AsymmetricAttention(nn.Module):
         )  # (total <= B * (N + L), 3, local_heads, head_dim)
         # Split qkv_x into q, k, v
 
-        @torch.compile(disable=DISABLE_COMPILE, mode="max-autotune-no-cudagraphs")
-        def process_qkv_x_before_attn(
-            qkv_x,
-            rope_cos,
-            rope_sin,
-            q_y,
-            k_y,
-            v_y,
-        ):
-            qkv_x = cp.all_to_all_collect_tokens_async_post_process(qkv_x)
-            q_x, k_x, v_x = qkv_x.unbind(0)  # (B, N, local_h, head_dim)
-            q_x = self.q_norm_x(q_x)
-            q_x = apply_rotary_emb_qk_real(q_x, rope_cos, rope_sin)
-            k_x = self.k_norm_x(k_x)
-            k_x = apply_rotary_emb_qk_real(k_x, rope_cos, rope_sin)
-
-            # qkv of y are : (B, L, local_heads, head_dim)
-            # Unite streams
-            qkv = unify_streams(
-                q_x,
-                k_x,
-                v_x,
-                q_y,
-                k_y,
-                v_y,
-                valid_token_indices,
-            )
-            return qkv
-
         xs_futures = []
         ys_futures = []
         for i, (buffer, future) in enumerate(qkv_x_futures):
             local_heads_i = comm_n_heads_aat * i
             future.wait()
-            qkv = process_qkv_x_before_attn(
+            qkv = self.process_qkv_x_before_attn(
                 qkv_x=buffer,
                 rope_cos=rope_rotation.get("rope_cos").narrow(dim=1, start=local_heads_i, length=comm_n_heads_aat),
                 rope_sin=rope_rotation.get("rope_sin").narrow(dim=1, start=local_heads_i, length=comm_n_heads_aat),
                 q_y=q_y.narrow(dim=2, start=local_heads_i, length=comm_n_heads_aat),
                 k_y=k_y.narrow(dim=2, start=local_heads_i, length=comm_n_heads_aat),
                 v_y=v_y.narrow(dim=2, start=local_heads_i, length=comm_n_heads_aat),
+                valid_token_indices=valid_token_indices,
             )
             x, y = self.run_attention(
                 qkv,
@@ -320,7 +328,7 @@ class AsymmetricAttention(nn.Module):
         cp_rank, cp_size = cp.get_cp_rank_size()
 
         @torch.compile(disable=DISABLE_COMPILE, mode="max-autotune-no-cudagraphs")
-        def process_y(ys):
+        def process_y(ys, cp_size):
             # y = torch.cat([y for y,f in ys_futures], dim=2) # (G B), L, heads, D
             y = torch.cat(ys, dim=2)  # (G B), L, heads, D
             y = rearrange(y, "(G B) L h D -> B L (G h D)", G=cp_size)  # (B, L, dim_x)
@@ -329,10 +337,10 @@ class AsymmetricAttention(nn.Module):
 
         for y, f in ys_futures:
             f.wait()
-        y = process_y([y for y, f in ys_futures])
+        y = process_y([y for y, f in ys_futures], cp_size)
 
         @torch.compile(disable=DISABLE_COMPILE, mode="max-autotune-no-cudagraphs")
-        def process_x(xs):
+        def process_x(xs, cp_size):
             x = torch.cat(xs, dim=1)
             x = cp.all_to_all_collect_heads_async_post_process(x)
             x = self.proj_x(x)  # (B, M, dim_x)
@@ -340,11 +348,11 @@ class AsymmetricAttention(nn.Module):
 
         for x, f in xs_futures:
             f.wait()
-        x = process_x([x for x, f in xs_futures])
+        x = process_x([x for x, f in xs_futures], cp_size)
         return x, y
 
 
-@torch.compile(disable=not COMPILE_MMDIT_BLOCK, mode="max-autotune-no-cudagraphs")
+@torch.compile(disable=not COMPILE_MMDIT_BLOCK)#, mode="max-autotune-no-cudagraphs")
 class AsymmetricJointBlock(nn.Module):
     def __init__(
         self,
