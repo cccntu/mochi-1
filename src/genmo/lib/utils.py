@@ -59,3 +59,94 @@ def save_video(final_frames, output_path, fps=30):
             subprocess.run(ffmpeg_cmd, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         except subprocess.CalledProcessError as e:
             print(f"Error occurred while running ffmpeg:\n{e.stderr.decode()}")
+
+
+import torch
+from contextlib import ContextDecorator
+from typing import Optional
+
+
+class CudaTimer(ContextDecorator):
+    """A context manager for timing CUDA operations with support for step-by-step timing and warmup steps.
+
+    Args:
+        name (str): Name of the timer for identification
+        skip_steps (int, optional): Number of initial steps to skip (warmup). Defaults to 0.
+        rank (int, optional): Process rank for distributed settings. Defaults to 0.
+    """
+
+    def __init__(self, name: str, skip_steps: int = 0, rank: int = 0):
+        self.name = name
+        self.skip_steps = skip_steps
+        self.current_step = 0
+        self.skipped_steps = 0
+        self.recorded_steps = 0
+        self.total_time = 0.0
+        self.start_event = None
+        self.end_event = None
+        self.rank = rank
+
+        # Verify CUDA availability
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is not available. This timer requires CUDA support.")
+
+    def __enter__(self):
+        """Start timing by recording a CUDA event."""
+        if self.rank == 0:
+            self.start_event = torch.cuda.Event(enable_timing=True)
+            self.start_event.record()
+        return self
+
+    def step(self):
+        """Record a timing step. Should be called after each operation to be timed."""
+        if self.rank != 0:
+            return
+
+        self.current_step += 1
+
+        # Handle warmup steps
+        if self.current_step <= self.skip_steps:
+            self.skipped_steps += 1
+            self.start_event = torch.cuda.Event(enable_timing=True)
+            self.start_event.record()
+            return
+
+        # Record end event for timing
+        self.end_event = torch.cuda.Event(enable_timing=True)
+        self.end_event.record()
+        torch.cuda.synchronize()  # Ensure timing is accurate
+
+        # Calculate and accumulate time
+        if self.start_event is not None and self.end_event is not None:
+            elapsed_time_ms = self.start_event.elapsed_time(self.end_event)
+            self.total_time += elapsed_time_ms
+            self.recorded_steps += 1
+
+        # Prepare for next step
+        self.start_event = torch.cuda.Event(enable_timing=True)
+        self.start_event.record()
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        """Clean up and finalize timing."""
+        if exc_type is not None:
+            return False  # Re-raise any exceptions
+
+        if self.rank == 0:
+            torch.cuda.synchronize()
+
+    @property
+    def average_time(self) -> float:
+        """Calculate average time per step in milliseconds."""
+        if self.recorded_steps == 0:
+            return 0.0
+        return self.total_time / self.recorded_steps
+
+    def summary(self) -> str:
+        """Return a string summary of timing statistics."""
+        return (
+            f"Timer '{self.name}' summary:\n"
+            f"Total time: {self.total_time:.2f}ms\n"
+            f"Steps recorded: {self.recorded_steps}\n"
+            f"Steps skipped: {self.skipped_steps}\n"
+            f"Average time per step: {self.average_time:.2f}ms"
+        )

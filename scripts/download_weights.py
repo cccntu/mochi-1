@@ -2,9 +2,10 @@
 import click
 import os
 
+
 # Based off of Kijai's script
 @click.command()
-@click.argument('output_dir', required=True)
+@click.argument("output_dir", required=True)
 def download_weights(output_dir):
     repo_id = "genmo/mochi-1-preview"
     model = "dit.safetensors"
@@ -18,6 +19,7 @@ def download_weights(output_dir):
         if not os.path.exists(file_path):
             print(f"Downloading mochi {description} to: {file_path}")
             from huggingface_hub import snapshot_download
+
             snapshot_download(
                 repo_id=repo_id,
                 allow_patterns=[f"*{filename}*"],
@@ -30,6 +32,7 @@ def download_weights(output_dir):
 
     download_file(repo_id, output_dir, model, "model")
     download_file(repo_id, output_dir, decoder, "decoder")
+
 
 if __name__ == "__main__":
     download_weights()

@@ -2,7 +2,7 @@ import json
 import os
 import random
 from abc import ABC, abstractmethod
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from typing import Any, Dict, List, Literal, Optional, Union, cast
 
@@ -33,7 +33,7 @@ from transformers.models.t5.modeling_t5 import T5Block
 import genmo.mochi_preview.dit.joint_model.context_parallel as cp
 import genmo.mochi_preview.vae.cp_conv as cp_conv
 from genmo.lib.progress import get_new_progress_bar, progress_bar
-from genmo.lib.utils import Timer
+from genmo.lib.utils import Timer, CudaTimer
 from genmo.mochi_preview.vae.models import (
     Decoder,
     decode_latents,
@@ -46,11 +46,16 @@ import xformers
 from xformers.profiler import PyTorchProfiler
 
 import torch._dynamo as dynamo
+
 dynamo.config.accumulated_cache_size_limit = 1024
 
 
 @contextmanager
-def time_cuda():
+def time_cuda(name):
+    rank, size = cp.get_cp_rank_size()
+    if rank != 0:
+        yield
+        return
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
 
@@ -63,10 +68,11 @@ def time_cuda():
 
     # Calculate elapsed time in milliseconds
     elapsed_time_ms = start_event.elapsed_time(end_event)
-    print(f"Elapsed time: {elapsed_time_ms} ms")
+    print(f"{name} | Elapsed time: {elapsed_time_ms} ms")
 
 
-DISABLE_PROFILER=os.environ.get("DISABLE_PROFILER") == "1"
+DISABLE_PROFILER = os.environ.get("DISABLE_PROFILER") == "1"
+
 
 def linear_quadratic_schedule(num_steps, threshold_noise, linear_steps=None):
     if linear_steps is None:
@@ -100,12 +106,12 @@ def setup_fsdp_sync(model, device_id, *, param_dtype, auto_wrap_policy) -> FSDP:
         ),
         auto_wrap_policy=auto_wrap_policy,
         backward_prefetch=BackwardPrefetch.BACKWARD_PRE,
-        #limit_all_gathers=True,
+        # limit_all_gathers=True,
         device_id=device_id,
         sync_module_states=True,
         use_orig_params=True,
         forward_prefetch=True,
-        limit_all_gathers=False, # might cause OOM?
+        limit_all_gathers=False,  # might cause OOM?
     )
     torch.cuda.synchronize()
     return model
@@ -127,7 +133,7 @@ class T5ModelFactory(ModelFactory):
 
     def get_model(self, *, local_rank, device_id, world_size):
         super().get_model(local_rank=local_rank, device_id=device_id, world_size=world_size)
-        #model = T5EncoderModel.from_pretrained(T5_MODEL)
+        # model = T5EncoderModel.from_pretrained(T5_MODEL)
         model = T5EncoderModel.from_pretrained(
             "black-forest-labs/FLUX.1-schnell",
             subfolder="text_encoder_2",
@@ -157,9 +163,7 @@ class DitModelFactory(ModelFactory):
 
             attention_mode = "sdpa" if flash_varlen_qkvpacked_attn is None else "flash"
         print(f"Attention mode: {attention_mode}")
-        super().__init__(
-            model_path=model_path, model_dtype=model_dtype, attention_mode=attention_mode
-        )
+        super().__init__(model_path=model_path, model_dtype=model_dtype, attention_mode=attention_mode)
 
     def get_model(self, *, local_rank, device_id, world_size):
         # TODO(ved): Set flag for torch.compile
@@ -279,7 +283,7 @@ def get_conditioning_for_prompts(tokenizer, encoder, device, prompts: List[str])
     # Sometimes returns a tensor, othertimes a tuple, not sure why
     # See: https://huggingface.co/genmo/mochi-1-preview/discussions/3
     assert tuple(y_feat[-1].shape) == (B, MAX_T5_TOKEN_LENGTH, 4096)
-    #assert y_feat[-1].dtype == torch.float32
+    # assert y_feat[-1].dtype == torch.float32
 
     return dict(y_mask=y_mask, y_feat=y_feat)
 
@@ -386,19 +390,22 @@ def sample_model(device, dit, conditioning, **args):
         return out_uncond + cfg_scale * (out_cond - out_uncond)
 
     # Euler sampler w/ customizable sigma schedule & cfg scale
-    for i in get_new_progress_bar(range(0, sample_steps), desc="Sampling"):
-        sigma = sigma_schedule[i]
-        dsigma = sigma - sigma_schedule[i + 1]
+    with CudaTimer("sampling steps", skip_steps=2) as timer:
+        for i in get_new_progress_bar(range(0, sample_steps), desc="Sampling"):
+            sigma = sigma_schedule[i]
+            dsigma = sigma - sigma_schedule[i + 1]
 
-        # `pred` estimates `z_0 - eps`.
-        pred = model_fn(
-            z=z,
-            sigma=torch.full([B] if cond_text else [B * 2], sigma, device=z.device),
-            cfg_scale=cfg_schedule[i],
-        )
-        assert pred.dtype == torch.float32
-        z = z + dsigma * pred
-        xformers.profiler.step()
+            # `pred` estimates `z_0 - eps`.
+            pred = model_fn(
+                z=z,
+                sigma=torch.full([B] if cond_text else [B * 2], sigma, device=z.device),
+                cfg_scale=cfg_schedule[i],
+            )
+            assert pred.dtype == torch.float32
+            z = z + dsigma * pred
+            xformers.profiler.step()
+            timer.step()
+        print(timer.summary())
 
     z = z[:B] if cond_batched else z
     return dit_latents_to_vae_latents(z)
@@ -559,7 +566,6 @@ class MochiMultiGPUPipeline:
     def __call__(self, **kwargs):
         def sample(ctx, *, batch_cfg, prompt, negative_prompt, **kwargs):
             with (
-
                 progress_bar(type="ray_tqdm", enabled=ctx.local_rank == 0),
                 torch.inference_mode(),
             ):
@@ -573,14 +579,14 @@ class MochiMultiGPUPipeline:
                 )
 
                 if DISABLE_PROFILER:
-                    profiler_context = time_cuda()
+                    profiler_context = nullcontext()
                 else:
                     profiler_context = xformers.profiler.profile(
                         output_dir="profile_data",
                         module=ctx.dit,
                         schedule=[
                             (PyTorchProfiler, 3, 5),
-                        ]
+                        ],
                     )
                 with profiler_context as prof:
                     latents = sample_model(ctx.device, ctx.dit, conditioning=conditioning, **kwargs)

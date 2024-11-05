@@ -38,10 +38,7 @@ def load_model():
         klass = MochiSingleGPUPipeline if num_gpus == 1 else MochiMultiGPUPipeline
         kwargs = dict(
             text_encoder_factory=T5ModelFactory(),
-            dit_factory=DitModelFactory(
-                model_path=f"{MOCHI_DIR}/dit.safetensors",
-                model_dtype="bf16"
-            ),
+            dit_factory=DitModelFactory(model_path=f"{MOCHI_DIR}/dit.safetensors", model_dtype="bf16"),
             decoder_factory=DecoderModelFactory(
                 model_path=f"{MOCHI_DIR}/decoder.safetensors",
             ),
@@ -100,16 +97,16 @@ def generate_video(
 
         assert isinstance(final_frames, np.ndarray)
         assert final_frames.dtype == np.float32
-        print(f'generation done')
+        print(f"generation done")
         os.makedirs("outputs", exist_ok=True)
         output_path = os.path.join("outputs", f"output_{int(time.time())}.mp4")
-
 
         save_video(final_frames, output_path)
         json_path = os.path.splitext(output_path)[0] + ".json"
         json.dump(args, open(json_path, "w"), indent=4)
 
         return output_path
+
 
 from textwrap import dedent
 
@@ -122,6 +119,7 @@ Additional lemons, one halved, are scattered around the base of the bowl.
 The even lighting enhances the vibrant colors and creates a fresh,
 inviting atmosphere.
 """)
+
 
 @click.command()
 @click.option("--prompt", default=DEFAULT_PROMPT, help="Prompt for video generation.")

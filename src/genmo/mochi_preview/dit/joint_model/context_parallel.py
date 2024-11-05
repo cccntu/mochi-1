@@ -71,6 +71,7 @@ def all_gather(tensor: torch.Tensor) -> torch.Tensor:
 
     return AllGatherIntoTensorFunction.apply(tensor, torch.float32, _CONTEXT_PARALLEL_GROUP)
 
+
 def all_gather_async(tensor: torch.Tensor) -> torch.Tensor:
     if not _CONTEXT_PARALLEL_GROUP:
         return tensor
@@ -136,6 +137,8 @@ def all_to_all_collect_tokens(x: torch.Tensor, num_heads: int) -> torch.Tensor:
         return x.permute(2, 0, 1, 3, 4)
 
     return CollectTokens.apply(x, _CONTEXT_PARALLEL_GROUP, num_heads)
+
+
 @torch.compiler.disable()
 def all_to_all_collect_tokens_async(qkv: torch.Tensor, num_heads: int, comm_n_heads_aat: int):
     group = _CONTEXT_PARALLEL_GROUP
@@ -166,32 +169,27 @@ def all_to_all_collect_tokens_async(qkv: torch.Tensor, num_heads: int, comm_n_he
         qkv_part = qkv.narrow(dim=2, start=i, length=comm_n_heads_aat).contiguous()
 
         output_buffer = torch.empty_like(qkv_part)
-        future = dist.all_to_all_single(
-            output=output_buffer,
-            input=qkv_part,
-            group=group,
-            async_op=True
-        )
+        future = dist.all_to_all_single(output=output_buffer, input=qkv_part, group=group, async_op=True)
         futures.append((output_buffer, future))
 
     return futures
+
+
 @torch.compiler.disable()
 def all_to_all_collect_tokens_async_one_part(qkv_part: torch.Tensor, output_buffer: torch.Tensor):
     """Split all_to_all one part at a time, return buffers and futures.
     NOTE: moved non-dist ops outside to support compile
     """
     group = _CONTEXT_PARALLEL_GROUP
-    #qkv_part = qkv.narrow(dim=2, start=i, length=comm_n_heads_aat).contiguous()
+    # qkv_part = qkv.narrow(dim=2, start=i, length=comm_n_heads_aat).contiguous()
 
-    future = dist.all_to_all_single(
-        output=output_buffer,
-        input=qkv_part,
-        group=group,
-        async_op=True
-    )
+    future = dist.all_to_all_single(output=output_buffer, input=qkv_part, group=group, async_op=True)
     return output_buffer, future
+
+
 def all_to_all_collect_tokens_async_post_process(x):
     return rearrange(x, "G M h B (qkv d) -> qkv B (G M) h d", qkv=3)
+
 
 # --------------------------------------------------------
 
@@ -227,23 +225,16 @@ def all_to_all_collect_heads(x: torch.Tensor) -> torch.Tensor:
 
 
 def all_to_all_collect_heads_async(x):
-    group =_CONTEXT_PARALLEL_GROUP
+    group = _CONTEXT_PARALLEL_GROUP
     group_size = dist.get_world_size(group)
 
     local_heads = x.size(2)
     head_dim = x.size(3)
     x = rearrange(x, "B (G M) h D -> G h M B D", G=group_size).contiguous()
     output = torch.empty_like(x)
-    future = dist.all_to_all_single(
-            output=output,
-            input=x,
-            group=group,
-            async_op=True
-        )
+    future = dist.all_to_all_single(output=output, input=x, group=group, async_op=True)
     return output, future
+
 
 def all_to_all_collect_heads_async_post_process(x):
     return rearrange(x, "G h M B D -> B M (G h D)")
-
-
-

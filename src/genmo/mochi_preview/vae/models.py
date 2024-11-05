@@ -903,6 +903,7 @@ def normalize_decoded_frames(samples):
     frames = rearrange(samples, "b c t h w -> b t h w c")
     return frames
 
+
 @torch.inference_mode()
 def decode_latents_tiled_full(
     decoder,
@@ -1005,6 +1006,7 @@ def decode_latents_tiled_spatial(
     decoded = apply_tiled(decoder, z, num_tiles_w, num_tiles_h, overlap, min_block_size)
     assert decoded is not None, f"Failed to decode latents with tiled spatial method"
     return normalize_decoded_frames(decoded)
+
 
 @torch.inference_mode()
 def decode_latents(decoder, z):
