@@ -49,6 +49,25 @@ import torch._dynamo as dynamo
 dynamo.config.accumulated_cache_size_limit = 1024
 
 
+@contextmanager
+def time_cuda():
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+
+    start_event.record()
+    yield None  # No profiler object in this case
+    end_event.record()
+
+    # Wait for the events to complete to ensure accurate timing
+    torch.cuda.synchronize()
+
+    # Calculate elapsed time in milliseconds
+    elapsed_time_ms = start_event.elapsed_time(end_event)
+    print(f"Elapsed time: {elapsed_time_ms} ms")
+
+
+DISABLE_PROFILER=os.environ.get("DISABLE_PROFILER") == "1"
+
 def linear_quadratic_schedule(num_steps, threshold_noise, linear_steps=None):
     if linear_steps is None:
         linear_steps = num_steps // 2
@@ -552,15 +571,21 @@ class MochiMultiGPUPipeline:
                     prompt=prompt,
                     negative_prompt=negative_prompt,
                 )
-                with xformers.profiler.profile(
-                    output_dir="profile_data",
-                    module=ctx.dit,
-                    schedule=[
-                        (PyTorchProfiler, 3, 5),
-                    ]
-                ) as prof:
+
+                if DISABLE_PROFILER:
+                    profiler_context = time_cuda()
+                else:
+                    profiler_context = xformers.profiler.profile(
+                        output_dir="profile_data",
+                        module=ctx.dit,
+                        schedule=[
+                            (PyTorchProfiler, 3, 5),
+                        ]
+                    )
+                with profiler_context as prof:
                     latents = sample_model(ctx.device, ctx.dit, conditioning=conditioning, **kwargs)
-                print(prof.format_summary())
+                if not DISABLE_PROFILER:
+                    print(prof.format_summary())
 
                 if ctx.local_rank == 0:
                     torch.save(latents, "latents.pt")

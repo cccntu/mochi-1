@@ -122,7 +122,24 @@ class AsymmetricAttention(nn.Module):
         # Process visual features
         qkv_x = self.qkv_x(x)  # (B, M, 3 * dim_x)
         assert qkv_x.dtype == torch.bfloat16
-        futures = cp.all_to_all_collect_tokens_async(qkv_x, self.num_heads, comm_n_heads_aat=comm_n_heads_aat)  # (3, B, N, local_h, head_dim)
+
+        _, cp_size = cp.get_cp_rank_size()
+        G = cp_size
+        h = self.num_heads // cp_size
+        qkv_x = rearrange(
+            qkv_x,
+            "B M (qkv G h d) -> G M h B (qkv d)",
+            qkv=3,
+            G=G,
+            h=h,
+        )
+        futures = []
+        for i in range(0, h, comm_n_heads_aat):
+            qkv_part = qkv_x.narrow(dim=2, start=i, length=comm_n_heads_aat).contiguous()
+            output_buffer = torch.empty_like(qkv_part)
+            futures.append(cp.all_to_all_collect_tokens_async_one_part(qkv_part, output_buffer))
+
+        #futures = cp.all_to_all_collect_tokens_async(qkv_x, self.num_heads, comm_n_heads_aat=comm_n_heads_aat)  # (3, B, N, local_h, head_dim)
 
         # Process text features
         y = modulated_rmsnorm(y, scale_y)  # (B, L, dim_y)

@@ -8,6 +8,7 @@ _CONTEXT_PARALLEL_GROUP_SIZE = None
 _CONTEXT_PARALLEL_GROUP_RANKS = None
 
 
+@torch.compiler.disable()
 def get_cp_rank_size():
     if _CONTEXT_PARALLEL_GROUP:
         return _CONTEXT_PARALLEL_RANK, _CONTEXT_PARALLEL_GROUP_SIZE
@@ -142,8 +143,6 @@ def all_to_all_collect_tokens_async(qkv: torch.Tensor, num_heads: int, comm_n_he
     B = qkv.size(0)
     G = cp_size = dist.get_world_size(group)
     h = local_heads = num_heads // cp_size
-    #parts = 3  # Split 6 local heads into 3 parts of 2 heads each
-
     # qkv: B M (qkv H d)
     # M: total seq len
     # H: total heads
@@ -152,6 +151,7 @@ def all_to_all_collect_tokens_async(qkv: torch.Tensor, num_heads: int, comm_n_he
     # h: local heads
     # "B M (qkv G h d) -> G M h B (qkv d)",
 
+    """
     rearranged = rearrange(
         qkv,
         "B M (qkv G h d) -> G M h B (qkv d)",
@@ -159,12 +159,11 @@ def all_to_all_collect_tokens_async(qkv: torch.Tensor, num_heads: int, comm_n_he
         G=G,
         h=h,
     )#.contiguous()
+    """
 
     futures = []
     for i in range(0, h, comm_n_heads_aat):
-        # dim=2
-        qkv_part = rearranged.narrow(dim=2, start=i, length=comm_n_heads_aat).contiguous()
-        #[:,:, i:i+1, :, :].contiguous()
+        qkv_part = qkv.narrow(dim=2, start=i, length=comm_n_heads_aat).contiguous()
 
         output_buffer = torch.empty_like(qkv_part)
         future = dist.all_to_all_single(
@@ -176,6 +175,21 @@ def all_to_all_collect_tokens_async(qkv: torch.Tensor, num_heads: int, comm_n_he
         futures.append((output_buffer, future))
 
     return futures
+@torch.compiler.disable()
+def all_to_all_collect_tokens_async_one_part(qkv_part: torch.Tensor, output_buffer: torch.Tensor):
+    """Split all_to_all one part at a time, return buffers and futures.
+    NOTE: moved non-dist ops outside to support compile
+    """
+    group = _CONTEXT_PARALLEL_GROUP
+    #qkv_part = qkv.narrow(dim=2, start=i, length=comm_n_heads_aat).contiguous()
+
+    future = dist.all_to_all_single(
+        output=output_buffer,
+        input=qkv_part,
+        group=group,
+        async_op=True
+    )
+    return output_buffer, future
 def all_to_all_collect_tokens_async_post_process(x):
     return rearrange(x, "G M h B (qkv d) -> qkv B (G M) h d", qkv=3)
 
